@@ -19,9 +19,13 @@ import scipy
 import torch
 from cv_bridge import CvBridge
 from model.faceDetector.s3fd import S3FD
-from std_msgs.msg import Int16
+from sensor_msgs.msg import CameraInfo
 from talkNet import talkNet as TalkNet
 
+from active_speaker_detection.msg import (
+    ActiveSpeakerPositionArrayCamera3D,
+    Camera3DPosition,
+)
 from sync_perception_signal.msg import VisionAudioPair
 
 
@@ -54,9 +58,16 @@ class ASDetector:
             self._process_perception_msg,
             queue_size=10,
         )
-        self.pub = rospy.Publisher("pub_to_robot", Int16, queue_size=1)
+        self.pub_active_speaker_position_array_camera_3D = rospy.Publisher(
+            "active_speaker_position_array_camera_3D",
+            ActiveSpeakerPositionArrayCamera3D,
+            queue_size=10,
+        )
         self.bridge = CvBridge()
         self.perception_msg_buffer = deque(maxlen=self.algs_args.buffer_max_length)
+        self.depth_info = rospy.wait_for_message(
+            "/camera/depth/camera_info", CameraInfo
+        )
 
         # loop
         self.thread_running = True
@@ -77,11 +88,18 @@ class ASDetector:
             current_perception_msg_buffer = copy.deepcopy(
                 list(self.perception_msg_buffer)
             )
-            current_image = current_perception_msg_buffer[-1]["visual"]["image"]
+            current_image = {
+                "color_image": current_perception_msg_buffer[-1]["visual"][
+                    "color_image"
+                ],
+                "depth_image": current_perception_msg_buffer[-1]["visual"][
+                    "depth_image"
+                ],
+            }
 
             # 如果最新的一帧里没有人脸，那就不进行ASD
             if len(current_perception_msg_buffer[-1]["visual"]["bboxes_position"]) == 0:
-                cv2.imshow("image", current_image)
+                cv2.imshow("image", current_image["color_image"])
                 cv2.waitKey(1)
                 continue
 
@@ -90,7 +108,7 @@ class ASDetector:
             if (
                 len(track_results) == 0
             ):  # len(track_result) >= self.algs_args.min_track这一句没通过
-                cv2.imshow("image", current_image)
+                cv2.imshow("image", current_image["color_image"])
                 cv2.waitKey(1)
                 continue
 
@@ -106,25 +124,32 @@ class ASDetector:
 
             # visualization
             self._viz_draw_bbox_and_text_on_image(
-                scores_multiple_people, visualization_bboxes, current_image
+                scores_multiple_people,
+                visualization_bboxes,
+                current_image["color_image"],
             )
-            cv2.imshow("image", current_image)
+            cv2.imshow("image", current_image["color_image"])
             cv2.waitKey(1)
 
-            # TEST FPS
-            a = Int16()
-            a.data = 1
-            self.pub.publish(a)
+            # Compute and pub active speaker's position in Camera 3D Coordinates
+            self._compute_and_pub_active_speaker_position(
+                scores_multiple_people,
+                visualization_bboxes,
+                current_image["depth_image"],
+            )
 
     def _process_perception_msg(self, audio_visual_pair_msg: VisionAudioPair):
         # time_step = audio_visual_pair_msg.time_step
         audio_recv = np.array(audio_visual_pair_msg.audio, dtype=np.int16)
-        image_recv = self.bridge.imgmsg_to_cv2(
-            audio_visual_pair_msg.image, desired_encoding="bgr8"
+        color_image_recv = self.bridge.imgmsg_to_cv2(
+            audio_visual_pair_msg.color_image, desired_encoding="bgr8"
         )
+        depth_image_recv = self.bridge.imgmsg_to_cv2(
+            audio_visual_pair_msg.depth_image, desired_encoding="16UC1"
+        )  # 深度图的原始编码是16位无符号整数
 
         # process visual msg
-        bboxes_position = self._detect_face(image_recv)
+        bboxes_position = self._detect_face(color_image_recv)
 
         # # process audio msg
         # audio_feature = self._process_audio_msg(audio_recv)
@@ -139,7 +164,11 @@ class ASDetector:
         # save msgs in buffer
         perception_msgs = {
             # "time_step": time_step,
-            "visual": {"image": image_recv, "bboxes_position": bboxes_position},
+            "visual": {
+                "color_image": color_image_recv,
+                "depth_image": depth_image_recv,
+                "bboxes_position": bboxes_position,
+            },
             "audio": audio_recv,
         }
         self.perception_msg_buffer.append(perception_msgs)
@@ -319,7 +348,9 @@ class ASDetector:
                 cs = self.algs_args.crop_scale
                 bs = smoothed_track_results["s"][i]  # Detection box size
                 bsi = int(bs * (1 + 2 * cs))  # Pad videos by this amount
-                image = current_perception_msg_buffer[image_index]["visual"]["image"]
+                image = current_perception_msg_buffer[image_index]["visual"][
+                    "color_image"
+                ]
                 image_padded = np.pad(
                     image,
                     ((bsi, bsi), (bsi, bsi), (0, 0)),
@@ -435,6 +466,39 @@ class ASDetector:
                 1.5,
                 (0, color, 255 - color),
                 5,
+            )
+
+    def _compute_and_pub_active_speaker_position(
+        self, scores_multiple_people, bboxes, depth_image
+    ):
+        # depth intrin
+        fx = self.depth_info.K[0]
+        fy = self.depth_info.K[4]
+        cx = self.depth_info.K[2]
+        cy = self.depth_info.K[5]
+
+        active_speaker_position_array_camera_3D = ActiveSpeakerPositionArrayCamera3D()
+        for score, bbox in zip(scores_multiple_people, bboxes):
+            if score <= 0:
+                continue
+            active_speaker_position_camera_3D = Camera3DPosition()
+            x_2D, y_2D = int(bbox["x"]), int(bbox["y"])
+            print(f"{x_2D}, {y_2D}")
+            z_camera_3D = depth_image[y_2D, x_2D] * 0.001  # m
+            if z_camera_3D == 0:
+                print("Camera Error!")
+                raise Exception("Camera error!")
+            x_camera_3D = (x_2D - cx) * z_camera_3D / fx
+            y_camera_3D = (y_2D - cy) * z_camera_3D / fy
+            active_speaker_position_camera_3D.x = x_camera_3D
+            active_speaker_position_camera_3D.y = y_camera_3D
+            active_speaker_position_camera_3D.z = z_camera_3D
+            active_speaker_position_array_camera_3D.data.append(
+                active_speaker_position_camera_3D
+            )
+        if len(active_speaker_position_array_camera_3D.data) > 0:
+            self.pub_active_speaker_position_array_camera_3D.publish(
+                active_speaker_position_array_camera_3D
             )
 
     def _bb_intersection_over_union(self, boxA, boxB, evalCol=False):
