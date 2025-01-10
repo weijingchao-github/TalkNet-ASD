@@ -51,6 +51,9 @@ class ASDetector:
         )
         self.active_speaker_detector.eval()
 
+        self.bridge = CvBridge()
+        self.perception_msg_buffer = deque(maxlen=self.algs_args.buffer_max_length)
+
         # ROS init
         rospy.Subscriber(
             "/sync_perception/sync_vision_audio_signal",
@@ -63,8 +66,6 @@ class ASDetector:
             ActiveSpeakerPositionArrayCamera3D,
             queue_size=10,
         )
-        self.bridge = CvBridge()
-        self.perception_msg_buffer = deque(maxlen=self.algs_args.buffer_max_length)
         self.depth_info = rospy.wait_for_message(
             "/camera/depth/camera_info", CameraInfo
         )
