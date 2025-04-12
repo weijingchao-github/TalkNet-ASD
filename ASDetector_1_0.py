@@ -11,6 +11,10 @@ import sys
 
 path = os.path.dirname(__file__)
 sys.path.insert(0, path)
+sys.path.insert(
+    0,
+    "/home/zxr/Documents/wjc/HRI/project/gaze_point_select_ws/devel/lib/python3/dist-packages",
+)
 
 import copy
 import threading
@@ -40,14 +44,16 @@ class ASDetector:
         )
         self.active_speaker_detector.eval()
         # others
+        self.viz_flag = False
+        self.count = 0  # for viz
         self.algs_args = SimpleNamespace(
             crop_scale=0.40,
             # smooth_window_size=5,
             min_ASD_greater_than_zero=5,
         )
-        audio_image_pub_frequency = rospy.get_param("/pub_frequency")
+        self.audio_image_pub_frequency = rospy.get_param("/pub_frequency")
         duration = rospy.get_param("/llm_inferecnce_duration")
-        self.per_seq_recv_times = audio_image_pub_frequency * duration
+        self.per_seq_recv_times = int(self.audio_image_pub_frequency * duration)
         self.recv_counter = 0
         self.do_ASD_flag = False
         self.seq_id = -1
@@ -78,7 +84,8 @@ class ASDetector:
 
     def _pipeline(self):
         while self.thread_running:
-            if self.do_ASD_flag:
+            if not self.do_ASD_flag:
+                time.sleep(0.001)
                 continue
             self.do_ASD_flag = False
             self.audio = None
@@ -92,7 +99,7 @@ class ASDetector:
             # 人走着走着进柱子后面被挡住了，转身看不见脸了属于corner case，先尝试着解决general case
             # 后面看看要不要做运动预测1.5s后人的位置
             current_msg = self.recv_msg_buffer_copy[-1]
-            if len(current_msg.Bbox) == 0:
+            if len(current_msg.bboxes_xyxy_and_ids) == 0:
                 self._pub_terminate_ASR_signal()
                 continue
 
@@ -110,7 +117,10 @@ class ASDetector:
             )
 
             # pub ASD result
-            self._pub_ASD_result(scores_multiple_people)
+            max_times_track_id = self._pub_ASD_result(scores_multiple_people)
+
+            if self.viz_flag:
+                self._visualization(max_times_track_id, track_results)
 
             # # visualization
             # self._viz_draw_bbox_and_text_on_image(
@@ -150,7 +160,9 @@ class ASDetector:
             }
         self.audio = self.recv_msg_buffer_copy[-1].audio
         track_results_keys = list(track_results.keys())
-        for index, recv_msg in enumerate(reversed(self.recv_msg_buffer_copy[:-1])):
+        for index, recv_msg in enumerate(
+            reversed(list(self.recv_msg_buffer_copy)[:-1])
+        ):
             index = -index - 2
             self.audio = np.concatenate([recv_msg.audio, self.audio])
             for bbox_xyxy_and_id in recv_msg.bboxes_xyxy_and_ids:
@@ -227,7 +239,7 @@ class ASDetector:
                     audio_recvs = np.concatenate([audio_recvs, audio_recv])
             cropped_face_images_and_audios.append(
                 {
-                    "track_id": track_results_single_person["key"],
+                    "track_id": track_results_single_person["track_id"],
                     "image": face_images,
                     "audio": audio_recvs,
                 }
@@ -243,7 +255,11 @@ class ASDetector:
 
     def _process_audio_msg(self, audio_recv):
         audio_feature = python_speech_features.mfcc(
-            audio_recv, 16000, numcep=13, winlen=0.025, winstep=0.010
+            audio_recv,
+            16000,
+            numcep=13,
+            winlen=0.025 * 25 / self.audio_image_pub_frequency,
+            winstep=0.010 * 25 / self.audio_image_pub_frequency,
         )
         return audio_feature
 
@@ -264,15 +280,6 @@ class ASDetector:
             images_detect = np.array(images_detect)
             audios_one_person = images_and_audios_one_person["audio"]  # np.array
             audios_detect = self._process_audio_msg(audios_one_person)  # np.array
-            # length = min(
-            #     (audios_detect.shape[0] - audios_detect.shape[0] % 4) / 100,
-            #     images_detect.shape[0] / 25,
-            # )
-            # audios_detect = audios_detect[audios_detect.shape[0] - int(round(length )), :]
-            # assert (
-            #     audios_detect.shape[0] - audios_detect.shape[0] % 4
-            # ) / 100 == images_detect.shape[0] / 25
-
             with torch.no_grad():
                 audios_detect = torch.FloatTensor(audios_detect).unsqueeze(0).cuda()
                 images_detect = torch.FloatTensor(images_detect).unsqueeze(0).cuda()
@@ -306,7 +313,7 @@ class ASDetector:
                 score = np.count_nonzero(score > 0)
                 scores_multiple_people.append(
                     {
-                        "tracker_id": images_and_audios_one_person["tracker_id"],
+                        "tracker_id": images_and_audios_one_person["track_id"],
                         "score": score,
                     }
                 )
@@ -335,6 +342,31 @@ class ASDetector:
                 5,
             )
 
+    def _visualization(self, max_times_track_id, face_track_results):
+        current_image = self.bridge.imgmsg_to_cv2(
+            (self.recv_msg_buffer_copy[-1]).color_image,
+            desired_encoding="bgr8",
+        )
+        for face_track_result in face_track_results:
+            track_id = face_track_result["track_id"]
+            bbox_color = None
+            if track_id == max_times_track_id:
+                self.count += 1
+                print(self.count)
+                bbox_color = (0, 0, 255)
+            else:
+                bbox_color = (0, 255, 0)
+            x1, y1, x2, y2 = face_track_result["bbox"][-1]
+            cv2.rectangle(
+                current_image,
+                (x1, y1),
+                (x2, y2),
+                bbox_color,
+                thickness=2,
+            )
+        cv2.imshow("ASD", current_image)
+        cv2.waitKey(1)
+
     def _pub_ASD_result(self, scores_multiple_people):
         max_times_track_id = -1
         max_times = -1
@@ -353,6 +385,9 @@ class ASDetector:
             self.pub_ASD_result.publish(pub_msg)
         else:
             self._pub_terminate_ASR_signal()
+
+        if self.viz_flag:
+            return max_times_track_id
 
     def _pub_terminate_ASR_signal(self):
         pub_msg = ActiveSpeakerAudio()
