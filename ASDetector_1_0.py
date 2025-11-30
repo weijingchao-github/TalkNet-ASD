@@ -233,6 +233,10 @@ class ASDetector:
                 face_image = cv2.resize(face_image, (224, 224))
                 face_images.append(face_image)
                 audio_recv = (self.recv_msg_buffer_copy[index]).audio
+                audio_recv = np.array(
+                    audio_recv, dtype=np.float32
+                )  # 转为float类型的numpy array，后面python_speech_features.mfcc要求它是float类型，不然会报错
+                audio_recv = audio_recv.squeeze()  # 确保是一维数组（避免多维干扰）
                 if audio_recvs is None:
                     audio_recvs = audio_recv
                 else:
@@ -407,3 +411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
