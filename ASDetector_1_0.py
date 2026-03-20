@@ -120,6 +120,7 @@ class ASDetector:
             max_times_track_id = self._pub_ASD_result(scores_multiple_people)
 
             if self.viz_flag:
+                print(1)
                 self._visualization(max_times_track_id, track_results)
 
             # # visualization
@@ -378,7 +379,7 @@ class ASDetector:
         for track_id_and_score in scores_multiple_people:
             if track_id_and_score["score"] < self.algs_args.min_ASD_greater_than_zero:
                 continue
-            if track_id_and_score["score"] > max_times_track_id:
+            if track_id_and_score["score"] > max_times:
                 max_times = track_id_and_score["score"]
                 max_times_track_id = track_id_and_score["tracker_id"]
         if max_times_track_id != -1:
@@ -411,4 +412,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
