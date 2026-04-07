@@ -120,7 +120,6 @@ class ASDetector:
             max_times_track_id = self._pub_ASD_result(scores_multiple_people)
 
             if self.viz_flag:
-                print(1)
                 self._visualization(max_times_track_id, track_results)
 
             # # visualization
